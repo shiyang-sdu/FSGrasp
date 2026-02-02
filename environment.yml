@@ -1,0 +1,21 @@
+name: contactpose_ml
+
+channels:
+  - pytorch
+  - open3d-admin
+
+dependencies:
+  - python=3.7
+  - pytorch=1.2.0
+  - torchvision
+  - matplotlib
+  - ignite
+  - open3d
+  - scikit-learn
+  - tqdm
+  - pip
+  - ipython
+  - pip:
+      - visdom
+      - transforms3d
+      - chumpy

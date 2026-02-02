@@ -1,0 +1,8 @@
+--- /home/samarth/research/contact_pose_ml_mano/models/pointnet.py
++++ /home/samarth/research/contact_pose_ml_mano/models/pointnet.py
+@@ -31,5 +31,4 @@
+         # x = F.dropout(x, p=0.5, training=self.training)
+         x = self.lin3(x)
+         return x
+-        # return F.log_softmax(x, dim=-1)
+ 
