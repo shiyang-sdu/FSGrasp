@@ -72,6 +72,20 @@ def train(data_dir, contactpose_dir, split, config_file, experiment_suffix=None,
   uniform_texture_weights = section.getboolean('uniform_texture_weights', False)
   n_surface_features = section.getint('n_feats')
 
+  # --- Loss hyperparameters (paper-consistent) ---
+  # Paper: L_all = L_S + lambda_c * L_C, with L_S = L_WCE + L_FL.
+  # We keep defaults so existing configs remain valid.
+  lambda_c = section.getfloat('lambda_c', 0.1)
+  focal_gamma = section.getfloat('focal_gamma', 2.0)
+  # If you wish to use class-wise alpha_c in focal loss, provide a comma-separated
+  # list in config as: focal_alpha = 1,1,1,... (length = #classes). Default: all 1.
+  focal_alpha_str = section.get('focal_alpha', '')
+  # Scalar fallback for focal alpha (used when focal_alpha is not provided as a list).
+  focal_alpha_scalar = 1.0
+  # Which class index represents the "highest-saliency" region for the centroid loss.
+  # Default: use the last class.
+  centroid_class = section.getint('centroid_class', -1)
+
   # cuda
   device = 'cuda:{:s}'.format(device_id)
 
@@ -100,33 +114,25 @@ def train(data_dir, contactpose_dir, split, config_file, experiment_suffix=None,
   splits = getattr(train_test_splits, 'split_{:s}'.format(split))
   if 'pointnet_A' in model_name:
     model = PointNetPP_A(n_surface_features, len(texture_weights), droprate)
-    loss_fn = tnn.CrossEntropyLoss(weight=texture_weights, ignore_index=-1)
-    if do_val:
-      val_loss_fn = tnn.CrossEntropyLoss(weight=texture_weights, ignore_index=-1)
   elif 'pointnet' in model_name:
     model = PointNetPP(n_surface_features, len(texture_weights), droprate)
-    loss_fn = tnn.CrossEntropyLoss(weight=texture_weights, ignore_index=-1)
-    if do_val:
-      val_loss_fn = tnn.CrossEntropyLoss(weight=texture_weights, ignore_index=-1)
   elif 'mlp' in model_name:
     n_hidden_nodes = config['hyperparams'].getint('n_hidden_nodes')
     model = MLPModel(n_surface_features, len(texture_weights), n_hidden_nodes,
         droprate)
-    loss_fn = tnn.CrossEntropyLoss(weight=texture_weights, ignore_index=-1)
-    if do_val:
-      val_loss_fn = tnn.CrossEntropyLoss(weight=texture_weights, ignore_index=-1)
   elif 'pointkan_A' in model_name:
     model = PointKAN_A(n_surface_features, len(texture_weights), droprate)
-    loss_fn = tnn.CrossEntropyLoss(weight=texture_weights, ignore_index=-1)
-    if do_val:
-      val_loss_fn = tnn.CrossEntropyLoss(weight=texture_weights, ignore_index=-1)
   elif 'pointkan' in model_name:
     model = PointKAN(n_surface_features, len(texture_weights), droprate)
-    loss_fn = tnn.CrossEntropyLoss(weight=texture_weights, ignore_index=-1)
-    if do_val:
-      val_loss_fn = tnn.CrossEntropyLoss(weight=texture_weights, ignore_index=-1)
   else:
     raise NotImplementedError
+
+  # Loss components (paper-consistent)
+  # L_S = L_WCE + L_FL (softmax multi-class), and L_all = L_S + lambda_c * L_C.
+  # We implement omega_t as a sample/point-level reweighting factor.
+  ce_loss = tnn.CrossEntropyLoss(ignore_index=-1, reduction='none')
+  if do_val:
+    val_ce_loss = tnn.CrossEntropyLoss(ignore_index=-1, reduction='none')
   train_dset = ContactPose3D(data_dir, contactpose_dir, grid_size, n_rotations,
       joint_droprate, **splits['train'], train_mode=True)
   if do_val:
@@ -138,9 +144,21 @@ def train(data_dir, contactpose_dir, split, config_file, experiment_suffix=None,
     model.load_state_dict(checkpoint.state_dict(), strict=True)
     logger.info('Loaded weights from {:s}'.format(weights_filename))
   model.to(device=device)
-  loss_fn.to(device=device)
+  # move loss helpers / weights to device
+  ce_loss.to(device=device)
+  texture_weights = texture_weights.to(device=device)
   if do_val:
-    val_loss_fn.to(device=device)
+    val_ce_loss.to(device=device)
+
+  # Parse focal alpha (optional)
+  focal_alpha_tensor = None
+  if isinstance(focal_alpha_str, str) and len(focal_alpha_str.strip()) > 0:
+    try:
+      alpha_list = [float(x) for x in focal_alpha_str.split(',')]
+      focal_alpha_tensor = torch.tensor(alpha_list, dtype=torch.float, device=device)
+    except Exception as e:
+      logger.warning('Failed to parse focal_alpha from config ("%s"): %s. Using alpha=1.',
+                     focal_alpha_str, str(e))
 
   # optimizer
   # optim = toptim.SGD(model.parameters(), lr=base_lr, weight_decay=weight_decay,
@@ -176,6 +194,124 @@ def train(data_dir, contactpose_dir, split, config_file, experiment_suffix=None,
       save_as_state_dict=True)
   checkpoint_dict = {'model': model, 'optim': optim}
 
+  # -------------------------
+  # Paper-consistent losses
+  # -------------------------
+  def _compute_focal_loss(logits: torch.Tensor, targets: torch.Tensor,
+                          alpha: torch.Tensor = None, gamma: float = 2.0,
+                          ignore_index: int = -1) -> torch.Tensor:
+    """Softmax multi-class focal loss computed only on the ground-truth class."""
+    # logits: (P, C), targets: (P,)
+    valid = targets.ne(ignore_index)
+    if valid.sum().item() == 0:
+      return torch.tensor(0.0, device=logits.device)
+    t = targets[valid].long()
+    log_probs = torch.log_softmax(logits[valid], dim=1)
+    probs = torch.exp(log_probs)
+    pt = probs.gather(1, t.unsqueeze(1)).squeeze(1)
+    logpt = log_probs.gather(1, t.unsqueeze(1)).squeeze(1)
+    if alpha is not None:
+      a = alpha.gather(0, t).to(dtype=logits.dtype)
+    else:
+      a = 1.0
+    fl = -a * torch.pow(1.0 - pt, gamma) * logpt
+    return fl.mean()
+
+  def _weighted_mean(values: torch.Tensor, weights: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    denom = torch.clamp(weights.sum(), min=eps)
+    return (values * weights).sum() / denom
+
+  def compute_losses(logits: torch.Tensor,
+                     labels: torch.Tensor,
+                     coords: torch.Tensor,
+                     batch_ids: torch.Tensor = None,
+                     texture_ids: torch.Tensor = None):
+    """Returns L_all and a dict of components.
+
+    - L_S = L_WCE + L_FL (softmax multi-class)
+    - L_all = L_S + lambda_c * L_C
+    - omega_t is applied as a point/sample reweighting factor.
+    """
+    C = logits.shape[1]
+    # texture interval id per point/sample
+    if texture_ids is None:
+      texture_ids = labels
+    texture_ids = texture_ids.long()
+
+    valid = labels.ne(-1)
+    if valid.sum().item() == 0:
+      zero = torch.tensor(0.0, device=logits.device)
+      return zero, {'L_WCE': zero, 'L_FL': zero, 'L_S': zero, 'L_C': zero}
+
+    # omega_t (point-wise)
+    omega = torch.ones_like(labels, dtype=torch.float, device=logits.device)
+    # for valid texture ids, lookup weight; clamp indices for safety
+    tex_valid = texture_ids.ne(-1) & valid
+    if tex_valid.sum().item() > 0:
+      tex_idx = texture_ids[tex_valid].clamp(min=0, max=texture_weights.numel()-1)
+      omega[tex_valid] = texture_weights.gather(0, tex_idx)
+    omega = omega[valid]
+
+    # ---- Saliency loss: WCE + Focal (both on softmax logits) ----
+    ce_per = ce_loss(logits, labels.long())  # (P,)
+    ce_per = ce_per[valid]
+    log_probs = torch.log_softmax(logits[valid], dim=1)
+    probs = torch.exp(log_probs)
+    t = labels[valid].long()
+    pt = probs.gather(1, t.unsqueeze(1)).squeeze(1)
+    logpt = log_probs.gather(1, t.unsqueeze(1)).squeeze(1)
+    if focal_alpha_tensor is not None and focal_alpha_tensor.numel() == C:
+      a = focal_alpha_tensor.gather(0, t).to(dtype=logits.dtype)
+    else:
+      a = focal_alpha_scalar
+    fl_per = -a * torch.pow(1.0 - pt, focal_gamma) * logpt
+
+    l_wce = _weighted_mean(ce_per, omega)
+    l_fl = _weighted_mean(fl_per, omega)
+    l_s = l_wce + l_fl
+
+    # ---- Centroid loss (regularizer) ----
+    # Encourage grasping around the object centroid via a probability-weighted centroid.
+    cls_idx = centroid_class if centroid_class >= 0 else (C - 1)
+    cls_idx = int(cls_idx)
+    p_high = probs[:, cls_idx].detach()  # (P_valid,)
+    coords_v = coords[valid]
+    if batch_ids is not None:
+      b = batch_ids[valid].long()
+      unique_b = torch.unique(b)
+    else:
+      b = None
+      unique_b = torch.tensor([0], device=logits.device)
+
+    lc_list = []
+    w_list = []
+    for bid in unique_b:
+      if b is None:
+        sel = torch.ones_like(p_high, dtype=torch.bool)
+      else:
+        sel = b.eq(bid)
+      if sel.sum().item() < 1:
+        continue
+      xyz = coords_v[sel]
+      # gt centroid = mean of all points in the sample
+      c_gt = xyz.mean(dim=0)
+      w = p_high[sel]
+      w_sum = torch.clamp(w.sum(), min=1e-12)
+      c_pred = (xyz * w.unsqueeze(1)).sum(dim=0) / w_sum
+      lc = torch.sum((c_pred - c_gt) ** 2)
+      lc_list.append(lc)
+      # sample-level omega: mean omega over points
+      w_list.append(omega[sel].mean())
+    if len(lc_list) == 0:
+      l_c = torch.tensor(0.0, device=logits.device)
+    else:
+      lc_stack = torch.stack(lc_list)
+      w_stack = torch.stack(w_list)
+      l_c = _weighted_mean(lc_stack, w_stack)
+
+    l_all = l_s + lambda_c * l_c
+    return l_all, {'L_WCE': l_wce, 'L_FL': l_fl, 'L_S': l_s, 'L_C': l_c}
+
   # train and val loops
   def train_loop(engine: Engine, batch):
     # occs, sdata, ijks, batch, colors = batch
@@ -188,38 +324,51 @@ def train(data_dir, contactpose_dir, split, config_file, experiment_suffix=None,
         batch[idx] = batch[idx].to(device=device, non_blocking=True)
       batch[2] = batch[2] / grid_size - 0.5
       pred = model(*batch[1:4])
-      loss = loss_fn(pred, batch[4])
+      texture_ids = batch[5] if len(batch) > 5 else None
+      loss, comps = compute_losses(pred, batch[4], coords=batch[2], batch_ids=batch[3], texture_ids=texture_ids)
     elif 'mlp' in model_name:
       use_idx = [1, 4]
       for idx in use_idx:
         batch[idx] = batch[idx].to(device=device, non_blocking=True)
       pred = model(batch[1])
-      loss = loss_fn(pred, batch[4])
+      texture_ids = batch[5] if len(batch) > 5 else None
+      # MLP branch may not provide coordinates/batch ids; fall back to None.
+      coords = batch[2] if len(batch) > 2 else None
+      batch_ids = batch[3] if len(batch) > 3 else None
+      loss, comps = compute_losses(pred, batch[4], coords=coords if coords is not None else batch[1].new_zeros((pred.shape[0], 3)),
+                                  batch_ids=batch_ids, texture_ids=texture_ids)
     elif 'pointnet' in model_name:
       use_idx = range(1, len(batch))
       for idx in use_idx:
         batch[idx] = batch[idx].to(device=device, non_blocking=True)
       batch[2] = batch[2] / grid_size - 0.5
       pred = model(*batch[1:4])
-      loss = loss_fn(pred, batch[4])
+      texture_ids = batch[5] if len(batch) > 5 else None
+      loss, comps = compute_losses(pred, batch[4], coords=batch[2], batch_ids=batch[3], texture_ids=texture_ids)
     elif 'pointkan_A' in model_name:
       use_idx = range(1, len(batch))
       for idx in use_idx:
         batch[idx] = batch[idx].to(device=device, non_blocking=True)
       batch[2] = batch[2] / grid_size - 0.5
       pred = model(*batch[1:4])
-      loss = loss_fn(pred, batch[4])
+      texture_ids = batch[5] if len(batch) > 5 else None
+      loss, comps = compute_losses(pred, batch[4], coords=batch[2], batch_ids=batch[3], texture_ids=texture_ids)
     elif 'pointkan' in model_name:
       use_idx = range(1, len(batch))
       for idx in use_idx:
         batch[idx] = batch[idx].to(device=device, non_blocking=True)
       batch[2] = batch[2] / grid_size - 0.5
       pred = model(*batch[1:4])
-      loss = loss_fn(pred, batch[4])
+      texture_ids = batch[5] if len(batch) > 5 else None
+      loss, comps = compute_losses(pred, batch[4], coords=batch[2], batch_ids=batch[3], texture_ids=texture_ids)
 
     loss.backward()
     optim.step()
     engine.state.train_loss = loss.item()
+    # Expose components for logging/debugging
+    engine.state.loss_wce = comps['L_WCE'].item() if 'L_WCE' in comps else None
+    engine.state.loss_fl = comps['L_FL'].item() if 'L_FL' in comps else None
+    engine.state.loss_c = comps['L_C'].item() if 'L_C' in comps else None
     return loss.item()
   trainer = Engine(train_loop)
   train_checkpoint_handler = ModelCheckpoint(score_name='train_loss',
@@ -238,14 +387,18 @@ def train(data_dir, contactpose_dir, split, config_file, experiment_suffix=None,
         batch[2] = batch[2] / grid_size - 0.5
         with torch.no_grad():
           pred = model(*batch[1:4])
-          loss = val_loss_fn(pred, batch[4])
+          texture_ids = batch[5] if len(batch) > 5 else None
+          loss, _ = compute_losses(pred, batch[4], coords=batch[2], batch_ids=batch[3], texture_ids=texture_ids)
       elif 'mlp' in model_name:
         use_idx = [1, 4]
         for idx in use_idx:
           batch[idx] = batch[idx].to(device=device, non_blocking=True)
         with torch.no_grad():
           pred = model(batch[1])
-          loss = val_loss_fn(pred, batch[4])
+          texture_ids = batch[5] if len(batch) > 5 else None
+          coords = batch[2] if len(batch) > 2 else batch[1].new_zeros((pred.shape[0], 3))
+          batch_ids = batch[3] if len(batch) > 3 else None
+          loss, _ = compute_losses(pred, batch[4], coords=coords, batch_ids=batch_ids, texture_ids=texture_ids)
       elif 'pointnet_A' in model_name:
         use_idx = range(1, len(batch))
         for idx in use_idx:
@@ -253,7 +406,8 @@ def train(data_dir, contactpose_dir, split, config_file, experiment_suffix=None,
         batch[2] = batch[2] / grid_size - 0.5
         with torch.no_grad():
           pred = model(*batch[1:4])
-          loss = val_loss_fn(pred, batch[4])
+          texture_ids = batch[5] if len(batch) > 5 else None
+          loss, _ = compute_losses(pred, batch[4], coords=batch[2], batch_ids=batch[3], texture_ids=texture_ids)
       elif 'pointkan_A' in model_name:
         use_idx = range(1, len(batch))
         for idx in use_idx:
@@ -261,7 +415,8 @@ def train(data_dir, contactpose_dir, split, config_file, experiment_suffix=None,
         batch[2] = batch[2] / grid_size - 0.5
         with torch.no_grad():
           pred = model(*batch[1:4])
-          loss = val_loss_fn(pred, batch[4])
+          texture_ids = batch[5] if len(batch) > 5 else None
+          loss, _ = compute_losses(pred, batch[4], coords=batch[2], batch_ids=batch[3], texture_ids=texture_ids)
       elif 'pointkan' in model_name:
         use_idx = range(1, len(batch))
         for idx in use_idx:
@@ -269,7 +424,8 @@ def train(data_dir, contactpose_dir, split, config_file, experiment_suffix=None,
         batch[2] = batch[2] / grid_size - 0.5
         with torch.no_grad():
           pred = model(*batch[1:4])
-          loss = val_loss_fn(pred, batch[4])
+          texture_ids = batch[5] if len(batch) > 5 else None
+          loss, _ = compute_losses(pred, batch[4], coords=batch[2], batch_ids=batch[3], texture_ids=texture_ids)
 
 
       engine.state.val_loss = loss.item()
